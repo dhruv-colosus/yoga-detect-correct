@@ -7,9 +7,6 @@ from tensorflow.keras.models import load_model
 import time
 import json
 import spacy  # Add this to imports
-import pickle
-from collections import defaultdict
-import datetime
 
 with open('average_keypoints.json', 'r') as f:
     reference_keypoints_dict = json.load(f)
@@ -30,19 +27,6 @@ try:
 except:
     print("Please install spacy and download en_core_web_sm model using: python -m spacy download en_core_web_sm")
     nlp = None
-
-USER_HISTORY_FILE = 'user_pose_history.pkl'
-try:
-    with open(USER_HISTORY_FILE, 'rb') as f:
-        user_history = pickle.load(f)
-except FileNotFoundError:
-    user_history = {
-        'pose_metrics': defaultdict(list),  # Store metrics history for each pose
-        'flexibility_scores': defaultdict(float),  # Store learned flexibility for different joints
-        'session_durations': [],  # Track how long user holds poses
-        'improvement_rate': defaultdict(list),  # Track improvement over time
-        'last_session': None
-    }
 
 def draw_text_with_custom_font(frame, text, position, color=(255, 255, 255)):
     """Helper function to draw text using PIL"""
@@ -169,42 +153,59 @@ def generate_correction_feedback(correction_metric, angle_differences, depth_met
     
     feedback = []
     
-    # Overall assessment with more positive metrics
-    if correction_metric < 0.35:  # Increased threshold significantly
-        feedback.append("You're doing great! Keep it up!")
+    # Overall assessment with more precise metrics
+    if correction_metric < 0.08:
+        feedback.append("Perfect form! Keep holding this position.")
+    elif correction_metric < 0.15:
+        feedback.append("Very good form with minimal adjustments needed.")
+    elif correction_metric < 0.25:
+        feedback.append("Good effort! Some specific adjustments will help perfect your pose.")
+    elif correction_metric < 0.35:
+        feedback.append("You're on the right track, but several adjustments are needed.")
     else:
-        feedback.append("Good effort! Let's make some small adjustments.")
+        feedback.append("Let's work on getting the basic alignment right.")
 
-    # Simplified joint-specific feedback with more encouraging tone
+    # Detailed joint-specific feedback
     for joint, data in angle_differences.items():
         difference = data['difference']
         direction = data['direction']
         
-        if difference > 25:  # Increased threshold
-            intensity = "slightly "  # Always use "slightly" to keep it encouraging
+        if difference > 15:  # More sensitive threshold
+            intensity = (
+                "slightly " if difference < 25 else
+                "moderately " if difference < 40 else
+                "significantly "
+            )
             
             joint_name = joint.replace('_', ' ').title()
             
             if joint == 'spine':
-                feedback.append(f"Try to adjust your back just a little bit.")
+                if direction == 'higher':
+                    feedback.append(f"Your back needs to be {intensity}more straight.")
+                else:
+                    feedback.append(f"Try to {intensity}straighten your back.")
             else:
                 action = "lower" if direction == 'higher' else "raise"
-                feedback.append(f"You could {intensity}{action} your {joint_name} a tiny bit.")
+                feedback.append(f"{intensity.title()}adjust your {joint_name} - try to {action} it.")
 
-    # Simplified depth feedback
-    if depth_metric > 0.15:  # Increased threshold
-        feedback.append("You're almost at the perfect position!")
+    # Depth-based feedback
+    if depth_metric > 0.1:
+        feedback.append("Try to maintain a more consistent depth in your pose.")
     
     # Use spaCy for natural language enhancement if available
     if nlp and len(feedback) > 1:
+        # Combine similar feedback points and make language more natural
         processed_feedback = []
         current_topic = None
         
         for point in feedback:
             doc = nlp(point)
+            
+            # Simple topic extraction
             topic = next((token.text for token in doc if token.dep_ == 'nsubj'), None)
             
             if current_topic and topic and current_topic in topic:
+                # Combine similar points
                 processed_feedback[-1] = processed_feedback[-1].replace('.', ' and ' + ' '.join(point.split()[1:]))
             else:
                 processed_feedback.append(point)
@@ -213,114 +214,6 @@ def generate_correction_feedback(correction_metric, angle_differences, depth_met
         feedback = processed_feedback
 
     return "\n".join(feedback)
-
-def update_user_metrics(pose_name, keypoints, correction_metric, angle_differences):
-    """Update user metrics and learning data"""
-    current_time = datetime.datetime.now()
-    
-    # Update pose metrics
-    user_history['pose_metrics'][pose_name].append({
-        'timestamp': current_time,
-        'correction_metric': correction_metric,
-        'angles': angle_differences
-    })
-    
-    # Keep only last 50 attempts for each pose
-    if len(user_history['pose_metrics'][pose_name]) > 50:
-        user_history['pose_metrics'][pose_name] = user_history['pose_metrics'][pose_name][-50:]
-    
-    # Update flexibility scores based on recent performance
-    for joint, data in angle_differences.items():
-        recent_angles = [m['angles'][joint]['difference'] 
-                        for m in user_history['pose_metrics'][pose_name][-10:]]
-        if recent_angles:
-            user_history['flexibility_scores'][joint] = sum(recent_angles) / len(recent_angles)
-    
-    # Calculate improvement rate
-    if len(user_history['pose_metrics'][pose_name]) >= 2:
-        recent_metrics = [m['correction_metric'] 
-                         for m in user_history['pose_metrics'][pose_name][-10:]]
-        user_history['improvement_rate'][pose_name] = (
-            recent_metrics[0] - recent_metrics[-1]
-        ) / len(recent_metrics)
-    
-    # Save updated history
-    with open(USER_HISTORY_FILE, 'wb') as f:
-        pickle.dump(user_history, f)
-
-def generate_personalized_feedback(correction_metric, angle_differences, depth_metric, pose_name):
-    """Generate feedback using reinforcement learning and user history"""
-    feedback = []
-    
-    # Get user's typical performance for this pose
-    pose_history = user_history['pose_metrics'][pose_name]
-    if pose_history:
-        avg_correction = sum(m['correction_metric'] for m in pose_history) / len(pose_history)
-        
-        # Compare current performance to user's average
-        if correction_metric <= avg_correction:
-            feedback.append("Great job! You're performing better than your usual!")
-        else:
-            feedback.append("You're doing well! Almost at your usual level.")
-    else:
-        feedback.append("Good start! Let's see how you progress!")
-    
-    # Personalized joint-specific feedback based on flexibility scores
-    for joint, data in angle_differences.items():
-        difference = data['difference']
-        direction = data['direction']
-        
-        # Get user's typical flexibility for this joint
-        typical_flexibility = user_history['flexibility_scores'][joint]
-        
-        if typical_flexibility > 0:
-            if difference > typical_flexibility * 1.2:  # User is struggling more than usual
-                intensity = "a bit "
-                joint_name = joint.replace('_', ' ').title()
-                
-                if joint == 'spine':
-                    feedback.append(f"Your back alignment needs {intensity}more attention today.")
-                else:
-                    action = "lower" if direction == 'higher' else "raise"
-                    feedback.append(f"Try to {action} your {joint_name} {intensity}more - I know you can do it!")
-            elif difference < typical_flexibility * 0.8:  # User is doing better than usual
-                joint_name = joint.replace('_', ' ').title()
-                feedback.append(f"Your {joint_name} alignment is better than usual!")
-    
-    # Add improvement-based feedback
-    improvement_rate = user_history['improvement_rate'].get(pose_name, 0)
-    if improvement_rate > 0:
-        feedback.append("You're showing consistent improvement in this pose!")
-    elif improvement_rate < 0:
-        feedback.append("Keep practicing - you'll get back to your best form!")
-    
-    # Add personalized tips based on historical challenges
-    common_challenges = get_common_challenges(pose_name)
-    if common_challenges:
-        feedback.append(f"Tip: Focus on your {common_challenges[0]} - "
-                       f"it's often the key to your best performance.")
-    
-    return "\n".join(feedback)
-
-def get_common_challenges(pose_name):
-    """Identify user's common challenges in a pose"""
-    if not user_history['pose_metrics'][pose_name]:
-        return []
-    
-    joint_difficulties = defaultdict(float)
-    
-    for entry in user_history['pose_metrics'][pose_name][-20:]:  # Look at last 20 attempts
-        for joint, data in entry['angles'].items():
-            joint_difficulties[joint] += data['difference']
-    
-    # Average out the difficulties
-    for joint in joint_difficulties:
-        joint_difficulties[joint] /= len(user_history['pose_metrics'][pose_name])
-    
-    # Return the joints with highest average difficulty
-    return sorted(joint_difficulties.keys(), 
-                 key=lambda x: joint_difficulties[x], 
-                 reverse=True)[:2]
 
 MODEL_PATH = 'yoga_poses_model_mini.h5'  
 DATA_PATH = 'sample-dataset'  
@@ -393,7 +286,7 @@ while cap.isOpened():
             # Get reference keypoints for the predicted pose
             reference_keypoints = np.array(reference_keypoints_dict[predicted_pose])
             correction_metric, angle_differences, depth_metric = calculate_correction_metrics(keypoints, reference_keypoints)
-            feedback_text = generate_personalized_feedback(correction_metric, angle_differences, depth_metric, predicted_pose)
+            feedback_text = generate_correction_feedback(correction_metric, angle_differences, depth_metric)
             last_feedback_time = current_time
 
         # Display feedback text at the bottom of the frame
